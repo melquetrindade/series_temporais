@@ -404,3 +404,242 @@ async def forecast_periodo(
         "seasonal_periods_used": seasonality,
         "future_weeks": future_periods
     }
+
+# ---------------------------
+# ENDPOINT: forecast_periodo_quinzenal
+# ---------------------------
+@app.post("/forecast_periodo_quinzenal")
+async def forecast_periodo_quinzenal(
+    file: UploadFile = File(...),
+    json_data: str = Form(...)
+):
+    params = json.loads(json_data)
+
+    base_sheets = params.get("base_sheets")
+    base_sheet = params.get("base_sheet")
+    if base_sheets is None and base_sheet:
+        base_sheets = [base_sheet]
+    if base_sheets is None:
+        return {"erro": "Informe base_sheets (lista) ou base_sheet (única)."}
+
+    target_year = int(params.get("target_year"))
+    date_col = params.get("date_col", "Data")
+    value_col = params.get("value_col", "Valor")
+
+    # sazonalidade padrão = 24 períodos (12 meses × 2 quinzenas)
+    requested_seasonality = int(params.get("seasonality", 12)) # ===== ALTERAR SAZONALIDADE 
+
+    contents = await file.read()
+    dfs_by_sheet = parse_excel_bytes(contents)
+
+    # validar abas
+    missing = [s for s in base_sheets if s not in dfs_by_sheet]
+    if missing:
+        return {
+            "erro": f"Abas não encontradas: {missing}. Abas disponíveis: {list(dfs_by_sheet.keys())}"
+        }
+
+    # Função auxiliar: converte uma data para o começo da quinzena (1 ou 16)
+    def to_quinzena(dt):
+        # dt deve ser Timestamp-like
+        try:
+            if dt.day <= 15:
+                return pd.Timestamp(dt.year, dt.month, 1)
+            else:
+                return pd.Timestamp(dt.year, dt.month, 16)
+        except Exception:
+            # fallback simples: tenta converter para Timestamp e reexecutar
+            dt2 = pd.to_datetime(dt, errors="coerce")
+            if pd.isna(dt2):
+                return None
+            if dt2.day <= 15:
+                return pd.Timestamp(dt2.year, dt2.month, 1)
+            return pd.Timestamp(dt2.year, dt2.month, 16)
+
+    # Função auxiliar: próxima quinzena após dt
+    def next_quinzena(dt):
+        if dt.day == 1:
+            return pd.Timestamp(dt.year, dt.month, 16)
+        else:
+            # 16 -> 1 do mês seguinte
+            return (dt + pd.offsets.MonthEnd(0)) + pd.Timedelta(days=1)
+
+    # Gera lista de datas de quinzenas alinhadas (1 ou 16)
+    def gerar_datas_quinzenas(start, periods):
+        datas = []
+        dt = pd.to_datetime(start)
+        # garantir que start seja 1 ou 16; se não for, alinhamos para a próxima quinzena correta
+        if dt.day <= 15:
+            dt = pd.Timestamp(dt.year, dt.month, 1)
+        else:
+            dt = pd.Timestamp(dt.year, dt.month, 16)
+
+        for _ in range(periods):
+            datas.append(pd.Timestamp(dt.year, dt.month, dt.day))
+            dt = next_quinzena(dt)
+        return pd.DatetimeIndex(datas)
+
+    # carregar e combinar todas as abas base
+    df_list = []
+    parsed_years = []
+    for s in base_sheets:
+        df_s = dfs_by_sheet[s].copy()
+        df_s["_sheet"] = s
+        df_list.append(df_s)
+
+        y = sheet_name_to_year(s)
+        if y is not None:
+            parsed_years.append(y)
+
+    combined = pd.concat(df_list, ignore_index=True)
+    combined[date_col] = pd.to_datetime(combined[date_col], dayfirst=True, errors="coerce")
+    combined = combined.dropna(subset=[date_col])
+
+    if combined.empty:
+        return {"erro": "As abas selecionadas não contêm datas válidas."}
+
+    combined = combined.sort_values(date_col).set_index(date_col)
+
+    # -----------------------------
+    # AGREGAÇÃO QUINZENAL CORRETA (1–15 / 16–fim)
+    # -----------------------------
+    # adiciona coluna 'quinzena' com timestamp 1 ou 16 do mês
+    combined["quinzena"] = combined.index.map(to_quinzena)
+    # remove possíveis None
+    combined = combined.dropna(subset=["quinzena"])
+    # agrupa por quinzena e soma valores
+    series_base_quinzenal = combined.groupby("quinzena")[value_col].sum()
+    # garantir índice como DatetimeIndex e ordenado
+    series_base_quinzenal.index = pd.to_datetime(series_base_quinzenal.index)
+    series_base_quinzenal = series_base_quinzenal.sort_index()
+
+    if len(series_base_quinzenal.dropna()) < 4:
+        return {"erro": "Poucos dados para previsão quinzenal (mínimo 4 períodos agregados)."}
+
+    # detectar ano máximo base
+    max_base_year = max(parsed_years) if parsed_years else None
+
+    if max_base_year and target_year <= max_base_year:
+        return {"erro": "Ano alvo deve ser maior que o maior ano base."}
+
+    # -------------------------------------------
+    # Início da previsão: próxima quinzena após a última existente
+    # -------------------------------------------
+    last_date = series_base_quinzenal.index[-1]
+    forecast_start = next_quinzena(last_date)
+
+    # -------------------------------------------
+    # Quantidade de quinzenas até o target_year
+    # -------------------------------------------
+    if max_base_year:
+        anos_a_prever = target_year - max_base_year
+    else:
+        anos_a_prever = target_year - last_date.year
+
+    if anos_a_prever < 1:
+        anos_a_prever = 1
+
+    # 24 quinzenas por ano (fixo)
+    future_periods = anos_a_prever * 24
+
+    forecast_index = gerar_datas_quinzenas(forecast_start, future_periods)
+
+    # -------------------------------------------
+    # AUTO-SAZONALIDADE
+    # -------------------------------------------
+    usable_len = len(series_base_quinzenal.dropna())
+    #seasonality = auto_adjust_seasonality(usable_len, requested_seasonality)
+    seasonality = 12 # ===== ALTERAR SAZONALIDADE 
+    logger.info(
+        f"[quinzenal] usable_len={usable_len}, requested={requested_seasonality}, usando seasonality={seasonality}"
+    )
+
+    # -------------------------------------------
+    # TREINAMENTO DO MODELO
+    # -------------------------------------------
+    try:
+        if seasonality and seasonality >= 2:
+            model = ExponentialSmoothing(
+                series_base_quinzenal,
+                trend="add",
+                seasonal="add",
+                seasonal_periods=seasonality
+            ).fit()
+        else:
+            model = ExponentialSmoothing(
+                series_base_quinzenal,
+                trend="add"
+            ).fit()
+
+    except Exception as e:
+        logger.warning(f"[quinzenal] Erro com sazonalidade: {e}. Tentando sem sazonalidade.")
+        model = ExponentialSmoothing(series_base_quinzenal, trend="add").fit()
+
+    # -------------------------------------------
+    # GERAR FORECAST
+    # -------------------------------------------
+    try:
+        raw_forecast = model.forecast(future_periods)
+    except Exception as e:
+        logger.error(f"[quinzenal] erro ao gerar forecast: {e}")
+        raw_forecast = [0.0] * future_periods
+
+    # garantir série com índice alinhado às datas geradas
+    forecast_values = ensure_forecast_values(raw_forecast, forecast_index)
+
+    # -------------------------------------------
+    # HISTÓRICO BASE
+    # -------------------------------------------
+    historico_base = safe_series_to_list(series_base_quinzenal)
+    historico_base = sanitize_list(historico_base)
+
+    # -------------------------------------------
+    # REAIS POR ANO (se existirem abas)
+    # -------------------------------------------
+    reais_por_ano = {}
+    sheet_year_map = {}
+
+    for s in dfs_by_sheet:
+        y = sheet_name_to_year(s)
+        if y is not None:
+            sheet_year_map[y] = s
+
+    if max_base_year:
+        for y in range(max_base_year + 1, target_year + 1):
+            if y in sheet_year_map:
+                dfy = dfs_by_sheet[sheet_year_map[y]].copy()
+                dfy[date_col] = pd.to_datetime(dfy[date_col], dayfirst=True, errors="coerce")
+                dfy = dfy.dropna(subset=[date_col]).sort_values(date_col).set_index(date_col)
+
+                # agrega por quinzena usando a mesma função to_quinzena
+                dfy["quinzena"] = dfy.index.map(to_quinzena)
+                dfy = dfy.dropna(subset=["quinzena"])
+                qy = dfy.groupby("quinzena")[value_col].sum()
+                qy.index = pd.to_datetime(qy.index)
+                qy = qy[qy.index.year == y]
+
+                if len(qy) > 0:
+                    reais_por_ano[y] = sanitize_list(safe_series_to_list(qy))
+
+    previsao_list = safe_series_to_list(forecast_values)
+    previsao_list = sanitize_list(previsao_list)
+
+    # -------------------------------------------
+    # RETORNO FINAL
+    # -------------------------------------------
+    return {
+        "base_sheets": base_sheets,
+        "base_years_guess": parsed_years,
+        "target_year": target_year,
+
+        "historico_base": historico_base,
+        "reais_por_ano": reais_por_ano,
+        "previsao": previsao_list,
+
+        "forecast_start": str(forecast_index[0].date()),
+        "forecast_end": str(forecast_index[-1].date()),
+
+        "future_periods": future_periods,
+        "seasonality_used": seasonality,
+    }
+
