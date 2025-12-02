@@ -135,9 +135,7 @@ class ForecastRequest(BaseModel):
     value_col: str = "Valor"
     seasonality: Optional[int] = None
 
-# ---------------------------
-# Util: carregar excel e dicionário de dataframes
-# ---------------------------
+
 def parse_excel_bytes(contents: bytes) -> Dict[str, pd.DataFrame]:
     excel = pd.ExcelFile(BytesIO(contents))
     dfs = {}
@@ -149,7 +147,7 @@ def parse_excel_bytes(contents: bytes) -> Dict[str, pd.DataFrame]:
     return dfs
 
 # ---------------------------
-# ENDPOINT: forecast_periodo_mensal (mensal) - atualizado
+# ENDPOINT: forecast_periodo_mensal
 # ---------------------------
 @app.post("/forecast_periodo_mensal")
 async def forecast_periodo_mensal(
@@ -280,4 +278,129 @@ async def forecast_periodo_mensal(
         "forecast_end": str(forecast_index[-1].date()),
         "future_months": future_periods,
         "seasonality_used": seasonality
+    }
+
+@app.post("/forecast_periodo")
+async def forecast_periodo(
+    file: UploadFile = File(...),
+    json_data: str = Form(...)
+):
+    params = json.loads(json_data)
+    base_sheets = params.get("base_sheets")
+    base_sheet = params.get("base_sheet")
+    if base_sheets is None and base_sheet:
+        base_sheets = [base_sheet]
+    if base_sheets is None:
+        return {"erro": "Informe base_sheets (lista) ou base_sheet (única)."}
+
+    target_year = int(params.get("target_year"))
+    date_col = params.get("date_col", "Data")
+    value_col = params.get("value_col", "Valor")
+    requested_seasonality = int(params.get("seasonality", 24)) # ===== ALTERAR SAZONALIDADE 
+
+    contents = await file.read()
+    dfs_by_sheet = parse_excel_bytes(contents)
+
+    missing = [s for s in base_sheets if s not in dfs_by_sheet]
+    if missing:
+        return {"erro": f"Abas não encontradas: {missing}. Abas disponíveis: {list(dfs_by_sheet.keys())}"}
+
+    # combinar abas selecionadas
+    df_list = []
+    parsed_years = []
+    for s in base_sheets:
+        df_s = dfs_by_sheet[s].copy()
+        df_s["_sheet"] = s
+        df_list.append(df_s)
+        y = sheet_name_to_year(s)
+        if y is not None:
+            parsed_years.append(y)
+
+    combined = pd.concat(df_list, ignore_index=True)
+    combined[date_col] = pd.to_datetime(combined[date_col], dayfirst=True, errors="coerce")
+    combined = combined.dropna(subset=[date_col])
+    if combined.empty:
+        return {"erro": "As abas selecionadas não contêm datas válidas."}
+    combined = combined.sort_values(date_col).set_index(date_col)
+
+    # agregação semanal (domingo como final de semana)
+    series_base_weekly = combined[value_col].resample("W-SUN").sum()
+
+    if len(series_base_weekly.dropna()) < 4:
+        return {"erro": "Poucos dados no ano(s) base após agregação semanal. Necessário pelo menos 4 semanas no conjunto combinado."}
+
+    max_base_year = max(parsed_years) if parsed_years else None
+    if max_base_year and target_year <= max_base_year:
+        return {"erro": "Ano alvo deve ser maior que o maior ano base selecionado."}
+
+    if max_base_year:
+        forecast_start = pd.to_datetime(f"{max_base_year + 1}-01-01")
+    else:
+        forecast_start = series_base_weekly.index[-1] + pd.Timedelta(weeks=1)
+
+    forecast_end = pd.to_datetime(f"{target_year}-12-31")
+    forecast_index = pd.date_range(start=forecast_start, end=forecast_end, freq="W-SUN")
+    if len(forecast_index) == 0:
+        return {"erro": "Período de previsão inválido (verifique anos base/target)."}
+
+    future_periods = len(forecast_index)
+
+    usable_len = len(series_base_weekly.dropna())
+    #seasonality = auto_adjust_seasonality(usable_len, requested_seasonality)
+    seasonality = 24 # ===== ALTERAR SAZONALIDADE 
+    logger.info(f"[semanal] usable_len={usable_len}, requested={requested_seasonality}, usando seasonality={seasonality}")
+
+    try:
+        if seasonality and seasonality >= 2:
+            model = ExponentialSmoothing(series_base_weekly, trend="add", seasonal="add", seasonal_periods=seasonality).fit()
+        else:
+            model = ExponentialSmoothing(series_base_weekly, trend="add").fit()
+    except Exception as e:
+        logger.warning(f"[semanal] Erro treinando modelo: {e}. Tentando sem sazonalidade.")
+        model = ExponentialSmoothing(series_base_weekly, trend="add").fit()
+
+    try:
+        raw_forecast = model.forecast(future_periods)
+    except Exception as e:
+        logger.error(f"[semanal] Erro ao gerar forecast: {e}")
+        raw_forecast = [0.0] * future_periods
+
+    forecast_values = ensure_forecast_values(raw_forecast, forecast_index)
+
+    historico_base_list = safe_series_to_list(series_base_weekly)
+
+    reais_por_ano = {}
+    sheet_year_map = {}
+    for s in dfs_by_sheet:
+        y = sheet_name_to_year(s)
+        if y is not None:
+            sheet_year_map[y] = s
+
+    if max_base_year:
+        for y in range(max_base_year + 1, target_year + 1):
+            if y in sheet_year_map:
+                sheet_name = sheet_year_map[y]
+                df_y = dfs_by_sheet[sheet_name].copy()
+                df_y[date_col] = pd.to_datetime(df_y[date_col], dayfirst=True, errors='coerce')
+                df_y = df_y.dropna(subset=[date_col]).sort_values(date_col).set_index(date_col)
+                series_y_weekly = df_y[value_col].resample("W-SUN").sum()
+                series_y_weekly = series_y_weekly[series_y_weekly.index.year == y]
+                if len(series_y_weekly) > 0:
+                    reais_por_ano[y] = safe_series_to_list(series_y_weekly)
+
+    historico_base_list = sanitize_list(historico_base_list)
+    reais_por_ano = {ano: sanitize_list(lista) for ano, lista in reais_por_ano.items()}
+    previsao_list = safe_series_to_list(forecast_values)
+
+    return {
+        "base_sheets": base_sheets,
+        "base_years_guess": parsed_years,
+        "target_year": target_year,
+        "forecast_start": str(forecast_index[0].date()),
+        "forecast_end": str(forecast_index[-1].date()),
+        "historico_base": historico_base_list,
+        "reais_por_ano": reais_por_ano,
+        "previsao": previsao_list,
+        "seasonal_periods_used": seasonality,
+        "future_weeks": future_periods
     }
