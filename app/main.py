@@ -643,3 +643,169 @@ async def forecast_periodo_quinzenal(
         "seasonality_used": seasonality,
     }
 
+# ---------------------------
+# ENDPOINT: forecast_periodo_trimestral
+# ---------------------------
+@app.post("/forecast_periodo_trimestral")
+async def forecast_periodo_trimestral(
+    file: UploadFile = File(...),
+    json_data: str = Form(...)
+):
+    params = json.loads(json_data)
+
+    base_sheets = params.get("base_sheets")
+    base_sheet = params.get("base_sheet")
+    if base_sheets is None and base_sheet:
+        base_sheets = [base_sheet]
+    if base_sheets is None:
+        return {"erro": "Informe base_sheets (lista) ou base_sheet (única)."}
+
+    target_year = int(params.get("target_year"))
+    date_col = params.get("date_col", "Data")
+    value_col = params.get("value_col", "Valor")
+
+    requested_seasonality = int(params.get("seasonality", 4))
+
+    contents = await file.read()
+    dfs_by_sheet = parse_excel_bytes(contents)
+
+    # validar abas
+    missing = [s for s in base_sheets if s not in dfs_by_sheet]
+    if missing:
+        return {"erro": f"Abas não encontradas: {missing}. Abas disponíveis: {list(dfs_by_sheet.keys())}"}
+
+    # carregar dataframes
+    df_list = []
+    parsed_years = []
+    for s in base_sheets:
+        df_s = dfs_by_sheet[s].copy()
+        df_list.append(df_s)
+
+        y = sheet_name_to_year(s)
+        if y is not None:
+            parsed_years.append(y)
+
+    combined = pd.concat(df_list, ignore_index=True)
+    combined[date_col] = pd.to_datetime(combined[date_col], dayfirst=True, errors="coerce")
+    combined = combined.dropna(subset=[date_col])
+    combined = combined.sort_values(date_col).set_index(date_col)
+
+    if combined.empty:
+        return {"erro": "As abas selecionadas não contêm datas válidas."}
+
+    # -------------------------------------
+    # AGREGAÇÃO TRIMESTRAL (1º dia do trimestre)
+    # -------------------------------------
+    series_base_tri = combined[value_col].resample("Q").sum()
+    series_base_tri.index = series_base_tri.index.to_period("Q").to_timestamp("Q")
+    series_base_tri = series_base_tri.sort_index()
+
+    if len(series_base_tri.dropna()) < 4:
+        return {"erro": "Poucos dados para previsão trimestral (mínimo 4 trimestres)."}
+
+    max_base_year = max(parsed_years)
+
+    if target_year <= max_base_year:
+        return {"erro": "Ano alvo deve ser maior que o maior ano base selecionado."}
+
+    # -------------------------------------
+    # PREVISÃO — datas trimestrais (CORRIGIDO)
+    # -------------------------------------
+
+    last_date = series_base_tri.index[-1]
+
+    # começa exatamente no próximo trimestre correto
+    forecast_start = last_date + pd.offsets.QuarterBegin()
+
+    # fim do último trimestre do ano alvo
+    forecast_end = pd.Timestamp(target_year, 12, 31)
+
+    # gera trimestres perfeitamente alinhados
+    forecast_index = pd.date_range(
+        start=forecast_start,
+        end=forecast_end,
+        freq="Q"
+    )
+
+    future_periods = len(forecast_index)
+
+    if future_periods <= 0:
+        return {"erro": "Não há trimestres para prever. Verifique ano alvo e dados base."}
+
+    # -------------------------------------
+    # AUTO-SAZONALIDADE
+    # -------------------------------------
+    usable_len = len(series_base_tri.dropna())
+    seasonality = auto_adjust_seasonality(usable_len, requested_seasonality)
+
+    # -------------------------------------
+    # TREINAR MODELO
+    # -------------------------------------
+    try:
+        if seasonality and seasonality >= 2:
+            model = ExponentialSmoothing(
+                series_base_tri,
+                trend="add",
+                seasonal="add",
+                seasonal_periods=seasonality
+            ).fit()
+        else:
+            model = ExponentialSmoothing(series_base_tri, trend="add").fit()
+    except Exception:
+        model = ExponentialSmoothing(series_base_tri, trend="add").fit()
+
+    # gerar forecast
+    try:
+        raw_forecast = model.forecast(future_periods)
+    except Exception:
+        raw_forecast = [0.0] * future_periods
+
+    forecast_values = ensure_forecast_values(raw_forecast, forecast_index)
+
+    # -------------------------------------
+    # HISTÓRICO BASE
+    # -------------------------------------
+    historico_base = sanitize_list(safe_series_to_list(series_base_tri))
+
+    # -------------------------------------
+    # REAIS POR ANO
+    # -------------------------------------
+    reais_por_ano = {}
+    sheet_year_map = {}
+
+    for s in dfs_by_sheet:
+        y = sheet_name_to_year(s)
+        if y is not None:
+            sheet_year_map[y] = s
+
+    for y in range(max_base_year + 1, target_year + 1):
+        if y in sheet_year_map:
+            dfy = dfs_by_sheet[sheet_year_map[y]].copy()
+            dfy[date_col] = pd.to_datetime(dfy[date_col], dayfirst=True, errors="coerce")
+            dfy = dfy.dropna(subset=[date_col]).sort_values(date_col).set_index(date_col)
+
+            qy = dfy[value_col].resample("Q").sum()
+            qy.index = qy.index.to_period("Q").to_timestamp("Q")
+
+            reais_por_ano[y] = sanitize_list(safe_series_to_list(qy))
+
+    previsao_list = sanitize_list(safe_series_to_list(forecast_values))
+
+    # -------------------------------------
+    # RETORNO FINAL
+    # -------------------------------------
+    return {
+        "base_sheets": base_sheets,
+        "base_years_guess": parsed_years,
+        "target_year": target_year,
+
+        "historico_base": historico_base,
+        "reais_por_ano": reais_por_ano,
+        "previsao": previsao_list,
+
+        "forecast_start": str(forecast_index[0].date()),
+        "forecast_end": str(forecast_index[-1].date()),
+
+        "future_periods": future_periods,
+        "seasonality_used": seasonality,
+    }
